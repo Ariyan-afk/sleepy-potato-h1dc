@@ -1,0 +1,24 @@
+{
+  "provisioning": "bundled",
+  "defaults": {
+    "paperVersion": "1.21.11",
+    "paperBuild": "69",
+    "maxPlayers": "10",
+    "branch": "main"
+  },
+  "secrets": [
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_CHANNEL_ID",
+    "GH_PAT",
+    "PLAYIT_SECRET",
+    "GDRIVE_SERVICE_ACCOUNT_JSON",
+    "GDRIVE_FOLDER_ID",
+    "RCON_PASSWORD"
+  ],
+  "variables": [
+    "PLAYIT_ADDRESS",
+    "MAX_PLAYERS",
+    "PAPER_VERSION",
+    "PAPER_BUILD"
+  ]
+}

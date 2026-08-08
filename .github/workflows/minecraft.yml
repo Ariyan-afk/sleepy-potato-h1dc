@@ -1,0 +1,155 @@
+name: Minecraft Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'start'
+        type: choice
+        options:
+          - start
+      paper_version:
+        description: 'Paper MC version'
+        required: false
+        default: '1.21.11'
+        type: string
+      paper_build:
+        description: 'Paper build number'
+        required: false
+        default: '69'
+        type: string
+
+concurrency:
+  group: minecraft-server
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      PLAYIT_SECRET: ${{ secrets.PLAYIT_SECRET }}
+      PLAYIT_ADDRESS: ${{ vars.PLAYIT_ADDRESS }}
+      GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
+      MC_OP_NAME: ${{ vars.MC_OP_NAME }}
+      MAX_PLAYERS: ${{ vars.MAX_PLAYERS }}
+      PAPER_VERSION: ${{ inputs.paper_version || vars.PAPER_VERSION || '1.21.11' }}
+      PAPER_BUILD: ${{ inputs.paper_build || vars.PAPER_BUILD || '69' }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install Google Drive SDK
+        run: |
+          pip install -q google-api-python-client google-auth
+
+      - name: Send starting notification
+        run: |
+          chmod +x scripts/notify.sh
+          source scripts/notify.sh
+          send_embed "⏳ Server Starting..." "Downloading Paper ${PAPER_VERSION} and loading world..." 16776960
+
+      - name: Download Paper
+        run: |
+          mkdir -p server-run
+          curl -o server-run/paper.jar \
+            "https://api.papermc.io/v2/projects/paper/versions/${PAPER_VERSION}/builds/${PAPER_BUILD}/downloads/paper-${PAPER_VERSION}-${PAPER_BUILD}.jar"
+          echo "eula=true" > server-run/eula.txt
+          cp server/server.properties server-run/
+          cp server/bukkit.yml server-run/
+          cp server/spigot.yml server-run/
+          mkdir -p server-run/config
+          cp -r server/config/* server-run/config/ 2>/dev/null || true
+          cp -r server/plugins server-run/
+          # Inject runtime secrets into server.properties
+          sed -i "s/^rcon.password=.*/rcon.password=${RCON_PASSWORD}/" server-run/server.properties
+          sed -i "s/^max-players=.*/max-players=${MAX_PLAYERS:-10}/" server-run/server.properties
+
+      - name: Download world from Google Drive
+        run: |
+          chmod +x scripts/world-load.sh
+          bash scripts/world-load.sh
+
+      - name: Setup playit.gg tunnel
+        run: |
+          echo "[PLAYIT] Starting tunnel via Docker..."
+          docker run -d --name playit --network host \
+            -e SECRET_KEY="$PLAYIT_SECRET" \
+            ghcr.io/playit-cloud/playit-agent:0.17
+          sleep 15
+          echo "[PLAYIT] === Docker Logs ==="
+          docker logs playit 2>&1 | tee /tmp/playit.log || true
+          echo "[PLAYIT] ==================="
+          # Try to extract tunnel address from logs
+          PLAYIT_ADDR=$(grep -oE '[a-z0-9-]+\.(gl\.)?joinmc\.link' /tmp/playit.log | head -1 || true)
+          if [ -n "$PLAYIT_ADDR" ]; then
+            echo "PLAYIT_ADDRESS=$PLAYIT_ADDR" >> $GITHUB_ENV
+            echo "[PLAYIT] Detected address: $PLAYIT_ADDR"
+          elif [ -n "$PLAYIT_ADDRESS" ]; then
+            echo "[PLAYIT] Using repo variable: $PLAYIT_ADDRESS"
+          else
+            echo "[PLAYIT] Warning: could not detect tunnel address from logs"
+          fi
+
+      - name: Start Minecraft Server
+        run: |
+          cd server-run
+
+          java -Xms512M -Xmx5G \
+            -XX:+UseG1GC \
+            -XX:+ParallelRefProcEnabled \
+            -XX:MaxGCPauseMillis=200 \
+            -XX:+UnlockExperimentalVMOptions \
+            -XX:+DisableExplicitGC \
+            -XX:G1NewSizePercent=30 \
+            -XX:G1MaxNewSizePercent=40 \
+            -XX:G1HeapRegionSize=8M \
+            -XX:G1ReservePercent=20 \
+            -XX:G1HeapWastePercent=5 \
+            -XX:G1MixedGCCountTarget=4 \
+            -XX:InitiatingHeapOccupancyPercent=15 \
+            -XX:G1MixedGCLiveThresholdPercent=90 \
+            -XX:G1RSetUpdatingPauseTimePercent=5 \
+            -XX:SurvivorRatio=32 \
+            -XX:+PerfDisableSharedMem \
+            -XX:MaxTenuringThreshold=1 \
+            -jar paper.jar --nogui &
+          MC_PID=$!
+          echo $MC_PID > /tmp/mc.pid
+
+          cd ..
+
+          echo "Server started (PID: $MC_PID). Launching monitor..."
+          python3 scripts/monitor.py
+
+      - name: Save world on exit
+        if: always()
+        run: |
+          chmod +x scripts/world-save.sh scripts/notify.sh
+          if [ -f /tmp/mc.pid ] && kill -0 $(cat /tmp/mc.pid) 2>/dev/null; then
+            echo "Stopping server gracefully..."
+            kill $(cat /tmp/mc.pid) 2>/dev/null
+            sleep 10
+          fi
+          bash scripts/world-save.sh
+          source scripts/notify.sh
+          send_embed "🔴 Server Stopped" "World has been saved to Google Drive.\nUse **/start** to play again." 16711680
