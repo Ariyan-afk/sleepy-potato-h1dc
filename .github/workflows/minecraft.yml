@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - start
+          - test
       paper_version:
         description: 'Paper MC version'
         required: false
@@ -30,7 +31,84 @@ permissions:
   actions: write
 
 jobs:
+  test-setup:
+    if: github.event.inputs.action == 'test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+      GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      PLAYIT_SECRET: ${{ secrets.PLAYIT_SECRET }}
+      PLAYIT_ADDRESS: ${{ vars.PLAYIT_ADDRESS }}
+      GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
+      PAPER_VERSION: ${{ inputs.paper_version || vars.PAPER_VERSION || '1.21.11' }}
+      PAPER_BUILD: ${{ inputs.paper_build || vars.PAPER_BUILD || '69' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify required secrets
+        run: |
+          missing=""
+          [ -z "$DISCORD_BOT_TOKEN" ] && missing="$missing DISCORD_BOT_TOKEN"
+          [ -z "$DISCORD_CHANNEL_ID" ] && missing="$missing DISCORD_CHANNEL_ID"
+          [ -z "$GITHUB_TOKEN" ] && missing="$missing GH_PAT"
+          [ -z "$PLAYIT_SECRET" ] && missing="$missing PLAYIT_SECRET"
+          [ -z "$GDRIVE_SERVICE_ACCOUNT_JSON" ] && missing="$missing GDRIVE_SERVICE_ACCOUNT_JSON"
+          [ -z "$GDRIVE_FOLDER_ID" ] && missing="$missing GDRIVE_FOLDER_ID"
+          [ -z "$RCON_PASSWORD" ] && missing="$missing RCON_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "Missing secrets:$missing"
+            exit 1
+          fi
+          echo "Required secrets are present."
+
+      - name: Check Paper download
+        run: |
+          URL="https://api.papermc.io/v2/projects/paper/versions/${PAPER_VERSION}/builds/${PAPER_BUILD}/downloads/paper-${PAPER_VERSION}-${PAPER_BUILD}.jar"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -L "$URL")
+          if [ "$CODE" != "200" ]; then
+            echo "Paper check failed: HTTP $CODE for ${PAPER_VERSION} build ${PAPER_BUILD}"
+            exit 1
+          fi
+          echo "Paper ${PAPER_VERSION}-${PAPER_BUILD} is available."
+
+      - name: Check Google Drive folder
+        run: |
+          pip install -q google-api-python-client google-auth
+          python3 - <<'PY'
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          sa = json.loads(os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"])
+          folder = os.environ["GDRIVE_FOLDER_ID"]
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=["https://www.googleapis.com/auth/drive"]
+          )
+          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+          meta = drive.files().get(fileId=folder, fields="id,name,mimeType", supportsAllDrives=True).execute()
+          print(f"Drive folder OK: {meta.get('name')} ({meta.get('id')})")
+          PY
+
+      - name: Notify Discord — passed
+        if: success()
+        run: |
+          chmod +x scripts/notify.sh
+          source scripts/notify.sh
+          send_embed "✅ Setup test passed" "Secrets, Paper version, and Google Drive folder look good.\nThis was a test — the Minecraft server was not started." 5763719
+
+      - name: Notify Discord — failed
+        if: failure()
+        run: |
+          chmod +x scripts/notify.sh
+          source scripts/notify.sh
+          send_embed "❌ Setup test failed" "Check GitHub Actions logs. The Minecraft server was not started." 15158332
+
   run-server:
+    if: github.event.inputs.action != 'test'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -80,7 +158,6 @@ jobs:
           mkdir -p server-run/config
           cp -r server/config/* server-run/config/ 2>/dev/null || true
           cp -r server/plugins server-run/
-          # Inject runtime secrets into server.properties
           sed -i "s/^rcon.password=.*/rcon.password=${RCON_PASSWORD}/" server-run/server.properties
           sed -i "s/^max-players=.*/max-players=${MAX_PLAYERS:-10}/" server-run/server.properties
 
@@ -99,7 +176,6 @@ jobs:
           echo "[PLAYIT] === Docker Logs ==="
           docker logs playit 2>&1 | tee /tmp/playit.log || true
           echo "[PLAYIT] ==================="
-          # Try to extract tunnel address from logs
           PLAYIT_ADDR=$(grep -oE '[a-z0-9-]+\.(gl\.)?joinmc\.link' /tmp/playit.log | head -1 || true)
           if [ -n "$PLAYIT_ADDR" ]; then
             echo "PLAYIT_ADDRESS=$PLAYIT_ADDR" >> $GITHUB_ENV
@@ -143,13 +219,30 @@ jobs:
 
       - name: Save world on exit
         if: always()
+        env:
+          JOB_CANCELLED: ${{ cancelled() }}
         run: |
           chmod +x scripts/world-save.sh scripts/notify.sh
+          source scripts/notify.sh
+          READY=0
+          [ -f /tmp/server-ready ] && READY=1
+
           if [ -f /tmp/mc.pid ] && kill -0 $(cat /tmp/mc.pid) 2>/dev/null; then
             echo "Stopping server gracefully..."
-            kill $(cat /tmp/mc.pid) 2>/dev/null
+            kill $(cat /tmp/mc.pid) 2>/dev/null || true
             sleep 10
           fi
+
+          if [ "$JOB_CANCELLED" = "true" ] && [ "$READY" != "1" ]; then
+            echo "Cancelled before the server was ready — skipping world-saved announcement."
+            send_embed "⚠️ Server start was cancelled" "The server never came online. Nothing new was saved to Google Drive." 15105570
+            exit 0
+          fi
+
+          if [ "$READY" != "1" ]; then
+            echo "Server never became ready — not announcing a saved world."
+            exit 0
+          fi
+
           bash scripts/world-save.sh
-          source scripts/notify.sh
           send_embed "🔴 Server Stopped" "World has been saved to Google Drive.\nUse **/start** to play again." 16711680
